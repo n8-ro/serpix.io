@@ -7,7 +7,13 @@ const io = require('socket.io')(server, {
         methods: ["GET", "POST"]
     },
     transports: ['websocket', 'polling'],
-    allowEIO3: true
+    allowEIO3: true,
+    pingInterval: 10000,
+    pingTimeout: 5000,
+    upgradeTimeout: 3000,
+    perMessageDeflate: {
+        threshold: 1024
+    }
 });
 
 // Serve static files
@@ -345,13 +351,13 @@ function gameLoop() {
     // Clean up kill notifications
     killNotifications = killNotifications.filter(n => now - n.createdAt < n.duration);
     
-    // Broadcast game state
+    // Broadcast game state (optimized for speed)
     io.emit('gameState', {
         snakes: snakes.map(s => ({
             id: s.id,
             name: s.name,
             color: s.color,
-            segments: s.segments.slice(0, Math.min(s.segments.length, 100)), // Limit segments sent
+            segments: s.segments.slice(0, Math.min(s.segments.length, 50)), // Reduced for faster transmission
             angle: s.angle,
             radius: s.radius,
             score: s.score,
@@ -360,7 +366,7 @@ function gameLoop() {
             powerBoost: s.powerBoost,
             invulnerable: s.invulnerable
         })),
-        foods,
+        foods: foods.slice(0, 800), // Limit food sent to reduce data
         killNotifications
     });
 }

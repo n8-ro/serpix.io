@@ -188,16 +188,22 @@
     const connectionStatus = document.getElementById('connection-status');
     const playerCountEl = document.getElementById('player-count');
 
-    // Socket.IO connection with explicit config
+    // Socket.IO connection with explicit config (optimized for speed)
     const socket = io({
         transports: ['websocket', 'polling'],
         reconnection: true,
         reconnectionDelay: 1000,
-        reconnectionAttempts: 5
+        reconnectionAttempts: 5,
+        upgrade: true,
+        rememberUpgrade: true
     });
     
     console.log('Attempting to connect to server...');
     let playerId = null;
+    let lastUpdateTime = Date.now();
+    let interpolationFactor = 0.3; // Smooth movement between updates
+    let lastDirectionSent = 0;
+    const DIRECTION_THROTTLE = 16; // Send direction updates max 60 times/sec
     let WORLD_SIZE = 8000;
     let isPlaying = false;
     let camera = { x: 0, y: 0 };
@@ -269,17 +275,14 @@
         window.addEventListener('mousemove', e => {
             mouse.x = e.clientX;
             mouse.y = e.clientY;
-            updateDirection();
         });
 
         window.addEventListener('mousedown', () => {
             mouse.down = true;
-            updateDirection();
         });
         
         window.addEventListener('mouseup', () => {
             mouse.down = false;
-            updateDirection();
         });
 
         // Mobile touch controls
@@ -308,7 +311,6 @@
             const touch = e.touches[0];
             mouse.x = touch.clientX;
             mouse.y = touch.clientY;
-            updateDirection();
         });
 
         startBtn.addEventListener('click', startGame);
@@ -318,6 +320,11 @@
 
     function updateDirection() {
         if (!isPlaying) return;
+        
+        // Throttle direction updates for better performance
+        const now = Date.now();
+        if (now - lastDirectionSent < DIRECTION_THROTTLE) return;
+        lastDirectionSent = now;
         
         const targetAngle = Math.atan2(mouse.y - windowHeight/2, mouse.x - windowWidth/2);
         socket.emit('updateDirection', {
@@ -637,6 +644,9 @@
             camera.x = player.segments[0].x - windowWidth / 2;
             camera.y = player.segments[0].y - windowHeight / 2;
             scoreVal.innerText = Math.floor(player.score);
+            
+            // Send direction updates at controlled rate
+            updateDirection();
         }
 
         drawGrid();
