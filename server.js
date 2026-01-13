@@ -5,7 +5,9 @@ const io = require('socket.io')(server, {
     cors: {
         origin: "*",
         methods: ["GET", "POST"]
-    }
+    },
+    transports: ['websocket', 'polling'],
+    allowEIO3: true
 });
 
 // Serve static files
@@ -111,7 +113,8 @@ function findSafeSpawnPoint() {
 
 // Socket.IO connection handling
 io.on('connection', (socket) => {
-    console.log('Player connected:', socket.id);
+    console.log('✅ Player connected:', socket.id);
+    console.log('Total players online:', io.engine.clientsCount);
     
     socket.on('join', (data) => {
         const playerSnake = createSnake(data.name || 'Player', '#10b981', false, socket.id);
