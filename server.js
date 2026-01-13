@@ -25,6 +25,7 @@ const FOOD_COUNT = 1200;
 const BOT_COUNT = 25;
 const COLORS = ['#ef4444', '#f59e0b', '#10b981', '#3b82f6', '#8b5cf6', '#ec4899', '#ffffff'];
 const MAX_RADIUS = 50;
+const MAGNET_DISTANCE = 150;
 const POWER_BOOST_INTERVAL = 120000; // 2 minutes
 const POWER_BOOST_DURATION = 5000; // 5 seconds
 
@@ -53,7 +54,8 @@ function createFood(isPremium = false) {
         radius: isPremium ? 8 : 3 + Math.random() * 4,
         color: COLORS[Math.floor(Math.random() * COLORS.length)],
         value: isPremium ? 10 : 1,
-        isPremium
+        isPremium,
+        magnetizedTo: null
     };
 }
 
@@ -71,8 +73,8 @@ function createSnake(name, color, isBot, socketId) {
         isBot,
         segments,
         angle: Math.random() * Math.PI * 2,
-        baseSpeed: 2,
-        speed: 2,
+        baseSpeed: 3,
+        speed: 3,
         baseRadius: 12,
         radius: 12,
         score: 0,
@@ -308,9 +310,22 @@ function gameLoop() {
             snake.segments.pop();
         }
         
-        // Food collision
+        // Food magnetism and collision
         foods.forEach((f, idx) => {
             const dist = Math.hypot(head.x - f.x, head.y - f.y);
+            
+            // Magnetism - pull food toward snake
+            if (dist < MAGNET_DISTANCE + (snake.radius * 2)) {
+                f.magnetizedTo = snake.id;
+            }
+            
+            if (f.magnetizedTo === snake.id) {
+                const pullAngle = Math.atan2(head.y - f.y, head.x - f.x);
+                f.x += Math.cos(pullAngle) * (snake.speed + 5);
+                f.y += Math.sin(pullAngle) * (snake.speed + 5);
+            }
+            
+            // Collision - eat food
             if (dist < snake.radius + f.radius) {
                 snake.score += f.value;
                 snake.radius = Math.min(MAX_RADIUS, snake.baseRadius + (snake.score * 0.005));
@@ -320,6 +335,9 @@ function gameLoop() {
                 } else {
                     foods[idx] = createFood(false);
                 }
+                
+                // Reset magnetism for new food
+                if (foods[idx]) foods[idx].magnetizedTo = null;
             }
         });
     });
