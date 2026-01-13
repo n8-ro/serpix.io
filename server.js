@@ -311,7 +311,7 @@ function gameLoop() {
             snake.segments.splice(1, 0, { x: midX, y: midY });
         }
         
-        const targetLength = INITIAL_SNAKE_LENGTH + (snake.score / 2);
+        const targetLength = INITIAL_SNAKE_LENGTH + (snake.score * 0.8); // Much faster growth!
         while (snake.segments.length > targetLength) {
             snake.segments.pop();
         }
