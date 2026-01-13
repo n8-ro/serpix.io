@@ -13,9 +13,9 @@ const io = require('socket.io')(server, {
 // Serve static files
 app.use(express.static('.'));
 
-// Serve multiplayer version as default
+// Serve index.html as default
 app.get('/', (req, res) => {
-    res.sendFile(__dirname + '/index-multiplayer.html');
+    res.sendFile(__dirname + '/index.html');
 });
 
 // Game Constants

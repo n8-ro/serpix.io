@@ -1,11 +1,11 @@
-
 <!DOCTYPE html>
 <html lang="en">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
-    <title>Serpix.io</title>
+    <title>Serpix.io - Multiplayer</title>
     <script src="https://cdn.tailwindcss.com"></script>
+    <script src="/socket.io/socket.io.js"></script>
     <style>
         body {
             margin: 0;
@@ -112,9 +112,28 @@
             background: #2563eb;
             transform: scale(1.02);
         }
+
+        #connection-status {
+            position: fixed;
+            top: 10px;
+            left: 10px;
+            background: rgba(0, 0, 0, 0.7);
+            padding: 8px 15px;
+            border-radius: 8px;
+            font-size: 14px;
+            z-index: 1000;
+        }
+
+        .status-connected { color: #10b981; }
+        .status-disconnected { color: #ef4444; }
+        .status-connecting { color: #f59e0b; }
     </style>
 </head>
 <body>
+
+<div id="connection-status" class="status-connecting">
+    <span id="status-text">● Connecting...</span>
+</div>
 
 <div id="game-container">
     <canvas id="gameCanvas"></canvas>
@@ -123,6 +142,7 @@
         <!-- Main Menu -->
         <div id="menu">
             <h1 class="text-3xl font-bold mb-6 text-white uppercase tracking-widest">Serpix.io</h1>
+            <p class="text-sm text-slate-400 mb-4">🌐 Multiplayer Mode</p>
             <input type="text" id="playerName" placeholder="Enter Nickname" maxlength="12">
             <button id="startBtn">ENTER REALM</button>
             <p class="mt-4 text-slate-400 text-sm">
@@ -141,7 +161,7 @@
         <div id="score-display" class="hud-element hidden">
             Mass: <span id="current-score">0</span>
             <br>
-            <span id="power-boost-timer" style="font-size: 14px; color: #fca5a5;">Next Rampage: <span id="timer-value">60</span>s</span>
+            <span id="power-boost-timer" style="font-size: 14px; color: #fca5a5;">Players: <span id="player-count">0</span></span>
         </div>
 
         <div id="minimap-container" class="hud-element hidden">
@@ -164,747 +184,76 @@
     const scoreDisplay = document.getElementById('score-display');
     const scoreVal = document.getElementById('current-score');
     const minimapContainer = document.getElementById('minimap-container');
+    const statusText = document.getElementById('status-text');
+    const connectionStatus = document.getElementById('connection-status');
+    const playerCountEl = document.getElementById('player-count');
 
-    // Game Constants
-    const WORLD_SIZE = 8000; // 2 times bigger (original was 4000)
-    const INITIAL_SNAKE_LENGTH = 20;
-    const FOOD_COUNT = 1200; // Adjusted for 2x world size
-    const BOT_COUNT = 25; // Adjusted for 2x world size
-    const COLORS = ['#ef4444', '#f59e0b', '#10b981', '#3b82f6', '#8b5cf6', '#ec4899', '#ffffff'];
-    const MAGNET_DISTANCE = 150;
-    const MAX_RADIUS = 50; 
-
-    // Game State
+    // Socket.IO connection with explicit config
+    const socket = io({
+        transports: ['websocket', 'polling'],
+        reconnection: true,
+        reconnectionDelay: 1000,
+        reconnectionAttempts: 5
+    });
+    
+    console.log('Attempting to connect to server...');
+    let playerId = null;
+    let WORLD_SIZE = 8000;
     let isPlaying = false;
     let camera = { x: 0, y: 0 };
-    let player = null;
-    let snakes = [];
-    let foods = [];
     let mouse = { x: 0, y: 0, down: false };
     let windowWidth, windowHeight;
-    let currentKing = null;
-    let lastPowerBoostTime = Date.now();
-    const POWER_BOOST_INTERVAL = 120000; // 2 minutes
-    const POWER_BOOST_DURATION = 5000; // 5 seconds
-    
-    // Double tap detection for mobile
     let lastTapTime = 0;
-    const DOUBLE_TAP_DELAY = 300; // milliseconds
-    
-    // Kill notifications
+    const DOUBLE_TAP_DELAY = 300;
+
+    // Game state from server
+    let snakes = [];
+    let foods = [];
     let killNotifications = [];
+    let currentKing = null;
 
-    class Food {
-        constructor(isPremium = false) {
-            this.isPremium = isPremium;
-            this.reset();
+    socket.on('connect', () => {
+        console.log('✅ Connected to server!', socket.id);
+        statusText.textContent = '● Connected';
+        connectionStatus.className = 'status-connected';
+    });
+
+    socket.on('disconnect', () => {
+        console.log('❌ Disconnected from server');
+        statusText.textContent = '● Disconnected';
+        connectionStatus.className = 'status-disconnected';
+        isPlaying = false;
+        endGame();
+    });
+    
+    socket.on('connect_error', (error) => {
+        console.error('Connection error:', error);
+        statusText.textContent = '● Connection Error';
+        connectionStatus.className = 'status-disconnected';
+    });
+
+    socket.on('init', (data) => {
+        playerId = data.playerId;
+        WORLD_SIZE = data.worldSize;
+    });
+
+    socket.on('gameState', (state) => {
+        snakes = state.snakes;
+        foods = state.foods;
+        killNotifications = state.killNotifications;
+        
+        const playerCount = snakes.filter(s => !s.isBot).length;
+        playerCountEl.textContent = playerCount;
+        
+        // Debug: log once every 3 seconds
+        if (Math.random() < 0.05) {
+            console.log(`Game state: ${snakes.length} snakes, ${foods.length} foods, ${playerCount} real players`);
         }
-        reset() {
-            this.x = Math.random() * WORLD_SIZE;
-            this.y = Math.random() * WORLD_SIZE;
-            this.radius = this.isPremium ? 8 : 3 + Math.random() * 4;
-            this.color = COLORS[Math.floor(Math.random() * COLORS.length)];
-            this.value = this.isPremium ? 10 : 1;
-            this.magnetizedTo = null;
-        }
-        draw() {
-            const screenX = this.x - camera.x;
-            const screenY = this.y - camera.y;
-            
-            if (screenX + 20 < 0 || screenX - 20 > windowWidth ||
-                screenY + 20 < 0 || screenY - 20 > windowHeight) return;
+    });
 
-            if (this.isPremium) {
-                ctx.shadowBlur = 15;
-                ctx.shadowColor = this.color;
-            }
-
-            ctx.beginPath();
-            ctx.arc(screenX, screenY, this.radius, 0, Math.PI * 2);
-            ctx.fillStyle = this.color;
-            ctx.fill();
-            ctx.closePath();
-            ctx.shadowBlur = 0;
-        }
-    }
-
-    class Snake {
-        constructor(name, color, isBot = false) {
-            this.name = name || "Unnamed";
-            this.color = color;
-            this.isBot = isBot;
-            this.segments = [];
-            this.angle = Math.random() * Math.PI * 2;
-            this.baseSpeed = 3;
-            this.speed = 3;
-            this.baseRadius = 12;
-            this.radius = 12;
-            this.score = 0;
-            this.dead = false;
-            this.isBoosting = false;
-            this.invulnerable = 60;
-            this.powerBoost = false;
-            this.powerBoostEndTime = 0;
-
-            // Smart Spawning: Find a spot with fewer snakes
-            const spawnPos = this.findSafeSpawnPoint();
-            const startX = spawnPos.x;
-            const startY = spawnPos.y;
-
-            for (let i = 0; i < INITIAL_SNAKE_LENGTH; i++) {
-                this.segments.push({ x: startX, y: startY });
-            }
-        }
-
-        findSafeSpawnPoint() {
-            let bestX = Math.random() * (WORLD_SIZE - 600) + 300;
-            let bestY = Math.random() * (WORLD_SIZE - 600) + 300;
-            let maxMinDist = -1;
-
-            const attempts = 15;
-            for (let i = 0; i < attempts; i++) {
-                const tx = Math.random() * (WORLD_SIZE - 600) + 300;
-                const ty = Math.random() * (WORLD_SIZE - 600) + 300;
-                let minDistToSnake = Infinity;
-
-                snakes.forEach(s => {
-                    if (s.dead || s.segments.length === 0) return;
-                    const d = Math.hypot(s.segments[0].x - tx, s.segments[0].y - ty);
-                    if (d < minDistToSnake) minDistToSnake = d;
-                });
-
-                if (minDistToSnake > maxMinDist) {
-                    maxMinDist = minDistToSnake;
-                    bestX = tx;
-                    bestY = ty;
-                }
-            }
-            return { x: bestX, y: bestY };
-        }
-
-        update() {
-            if (this.dead) return;
-            if (this.invulnerable > 0) this.invulnerable--;
-
-            // Check if power boost has expired
-            if (this.powerBoost && Date.now() > this.powerBoostEndTime) {
-                this.powerBoost = false;
-            }
-
-            // Power boost gives automatic boost
-            if (this.powerBoost) {
-                this.isBoosting = true;
-            } else {
-                this.isBoosting = this.isBot ? (Math.random() < 0.05 && this.score > 50) : mouse.down;
-            }
-
-            if (this.isBoosting && this.score > 20) {
-                this.speed = this.baseSpeed * 2;
-                // Don't lose points during power boost
-                if (!this.powerBoost && Date.now() % 5 === 0) this.score -= 1; 
-            } else {
-                this.speed = this.baseSpeed;
-            }
-
-            if (this.isBot) {
-                let targetAngle = null;
-                
-                // If bot has power boost, aggressively hunt the nearest snake
-                if (this.powerBoost) {
-                    let nearestSnake = null;
-                    let minDist = Infinity;
-                    snakes.forEach(s => {
-                        if (s === this || s.dead) return;
-                        const d = Math.hypot(s.segments[0].x - this.segments[0].x, s.segments[0].y - this.segments[0].y);
-                        if (d < minDist) {
-                            minDist = d;
-                            nearestSnake = s;
-                        }
-                    });
-                    
-                    if (nearestSnake) {
-                        // Chase the nearest snake's head aggressively
-                        targetAngle = Math.atan2(nearestSnake.segments[0].y - this.segments[0].y, nearestSnake.segments[0].x - this.segments[0].x);
-                        let diff = targetAngle - this.angle;
-                        while (diff < -Math.PI) diff += Math.PI * 2;
-                        while (diff > Math.PI) diff -= Math.PI * 2;
-                        this.angle += diff * 0.08; // Smooth turning even when hunting
-                    }
-                } else {
-                    // Normal bot behavior when not in power boost
-                    // Check if being wrapped/surrounded by another snake
-                    let beingWrapped = false;
-                    let wrapperSnake = null;
-                    snakes.forEach(s => {
-                        if (s === this || s.dead || s.score < this.score) return;
-                        
-                        // Count how many segments are nearby in different directions
-                        let segmentsNearby = 0;
-                        const checkRadius = 150;
-                        s.segments.forEach(seg => {
-                            const d = Math.hypot(seg.x - this.segments[0].x, seg.y - this.segments[0].y);
-                            if (d < checkRadius) segmentsNearby++;
-                        });
-                        
-                        // If many segments surround us, we're being wrapped
-                        if (segmentsNearby > 8) {
-                            beingWrapped = true;
-                            wrapperSnake = s;
-                        }
-                    });
-                    
-                    // If being wrapped, try to escape or stay near edge
-                    if (beingWrapped && wrapperSnake) {
-                        const myX = this.segments[0].x;
-                        const myY = this.segments[0].y;
-                        
-                        // Find the nearest segment of the wrapper
-                        let nearestSeg = null;
-                        let nearestDist = Infinity;
-                        wrapperSnake.segments.forEach(seg => {
-                            const d = Math.hypot(seg.x - myX, seg.y - myY);
-                            if (d < nearestDist) {
-                                nearestDist = d;
-                                nearestSeg = seg;
-                            }
-                        });
-                        
-                        // Look for gaps in the wrapper's circle (potential escape routes)
-                        let largestGap = null;
-                        let largestGapSize = 0;
-                        const angleSteps = 16;
-                        
-                        for (let i = 0; i < angleSteps; i++) {
-                            const angle = (i / angleSteps) * Math.PI * 2;
-                            const checkDist = 100;
-                            const testX = myX + Math.cos(angle) * checkDist;
-                            const testY = myY + Math.sin(angle) * checkDist;
-                            
-                            // Check distance to nearest wrapper segment in this direction
-                            let minDistInDir = Infinity;
-                            wrapperSnake.segments.forEach(seg => {
-                                const d = Math.hypot(seg.x - testX, seg.y - testY);
-                                if (d < minDistInDir) minDistInDir = d;
-                            });
-                            
-                            // If this direction has a large gap, it's a potential escape route
-                            if (minDistInDir > largestGapSize) {
-                                largestGapSize = minDistInDir;
-                                largestGap = angle;
-                            }
-                        }
-                        
-                        // Decide strategy: escape if gap is big enough, otherwise stay near edge
-                        if (largestGapSize > wrapperSnake.radius * 3 + 60) {
-                            // Try to escape through the largest gap
-                            const escapeAngle = largestGap;
-                            let diff = escapeAngle - this.angle;
-                            while (diff < -Math.PI) diff += Math.PI * 2;
-                            while (diff > Math.PI) diff -= Math.PI * 2;
-                            this.angle += diff * 0.07;
-                        } else {
-                            // Stay near the edge, move along the wrapper's body to keep hole large
-                            // Get angle to nearest segment
-                            const angleToNearestSeg = Math.atan2(nearestSeg.y - myY, nearestSeg.x - myX);
-                            
-                            // Move perpendicular to maintain distance (follow the edge)
-                            const tangentAngle = angleToNearestSeg + Math.PI / 2;
-                            
-                            // If getting too close to wrapper, move away
-                            if (nearestDist < wrapperSnake.radius + this.radius + 40) {
-                                // Move away from wrapper
-                                const awayAngle = angleToNearestSeg + Math.PI;
-                                let diff = awayAngle - this.angle;
-                                while (diff < -Math.PI) diff += Math.PI * 2;
-                                while (diff > Math.PI) diff -= Math.PI * 2;
-                                this.angle += diff * 0.06;
-                            } else {
-                                // Follow the edge tangentially
-                                let diff = tangentAngle - this.angle;
-                                while (diff < -Math.PI) diff += Math.PI * 2;
-                                while (diff > Math.PI) diff -= Math.PI * 2;
-                                this.angle += diff * 0.05;
-                            }
-                        }
-                    } else {
-                        // Wall avoidance: check if approaching walls
-                        const wallBuffer = 200;
-                        const myX = this.segments[0].x;
-                        const myY = this.segments[0].y;
-                        const lookAheadDist = 100 + this.radius * 3;
-                        const checkX = myX + Math.cos(this.angle) * lookAheadDist;
-                        const checkY = myY + Math.sin(this.angle) * lookAheadDist;
-                        
-                        let wallDanger = false;
-                        let turnTowardCenter = false;
-                        
-                        // Check if heading toward wall
-                        if (checkX < wallBuffer || checkX > WORLD_SIZE - wallBuffer ||
-                            checkY < wallBuffer || checkY > WORLD_SIZE - wallBuffer) {
-                            wallDanger = true;
-                            turnTowardCenter = true;
-                        }
-                        
-                        // Also check current position near walls
-                        if (myX < wallBuffer * 1.5 || myX > WORLD_SIZE - wallBuffer * 1.5 ||
-                            myY < wallBuffer * 1.5 || myY > WORLD_SIZE - wallBuffer * 1.5) {
-                            wallDanger = true;
-                            turnTowardCenter = true;
-                        }
-                        
-                        if (turnTowardCenter) {
-                            // Turn toward center of map
-                            const centerX = WORLD_SIZE / 2;
-                            const centerY = WORLD_SIZE / 2;
-                            const angleToCenter = Math.atan2(centerY - myY, centerX - myX);
-                            let diff = angleToCenter - this.angle;
-                            while (diff < -Math.PI) diff += Math.PI * 2;
-                            while (diff > Math.PI) diff -= Math.PI * 2;
-                            this.angle += diff * 0.06;
-                        } else {
-                            // Collision avoidance: check for snakes ahead and find safe path around
-                            let dangerAhead = false;
-                            let dangerSnake = null;
-                            
-                            snakes.forEach(s => {
-                                if (s === this || s.dead) return;
-                                for (let i = 0; i < s.segments.length; i++) {
-                                    const seg = s.segments[i];
-                                    const d = Math.hypot(checkX - seg.x, checkY - seg.y);
-                                    if (d < this.radius + s.radius + 40) {
-                                        dangerAhead = true;
-                                        dangerSnake = s;
-                                        break;
-                                    }
-                                }
-                            });
-                        
-                            // If danger ahead, find a path around the body
-                            if (dangerAhead && dangerSnake) {
-                                // Find which way to turn by checking both sides
-                                const leftAngle = this.angle - Math.PI / 2;
-                                const rightAngle = this.angle + Math.PI / 2;
-                                const checkDist = 80;
-                                
-                                const leftX = this.segments[0].x + Math.cos(leftAngle) * checkDist;
-                                const leftY = this.segments[0].y + Math.sin(leftAngle) * checkDist;
-                                const rightX = this.segments[0].x + Math.cos(rightAngle) * checkDist;
-                                const rightY = this.segments[0].y + Math.sin(rightAngle) * checkDist;
-                                
-                                let leftClear = true;
-                                let rightClear = true;
-                                
-                                dangerSnake.segments.forEach(seg => {
-                                    if (Math.hypot(leftX - seg.x, leftY - seg.y) < this.radius + dangerSnake.radius + 30) {
-                                        leftClear = false;
-                                    }
-                                    if (Math.hypot(rightX - seg.x, rightY - seg.y) < this.radius + dangerSnake.radius + 30) {
-                                        rightClear = false;
-                                    }
-                                });
-                                
-                                // Turn toward the clearer side
-                                if (leftClear && !rightClear) {
-                                    this.angle += 0.07;
-                                } else if (rightClear && !leftClear) {
-                                    this.angle -= 0.07;
-                                } else {
-                                    this.angle += (Math.random() < 0.5 ? 1 : -1) * 0.07;
-                                }
-                            } else {
-                                // Smart bots: if over 500 points, try to wrap around much smaller snakes
-                                if (this.score > 500) {
-                                    let targetSnake = null;
-                                    let minDist = 1200; // Increased search radius
-                                    snakes.forEach(s => {
-                                        if (s === this || s.dead) return;
-                                        // Only target snakes that are 5x smaller
-                                        if (s.score * 5 > this.score) return;
-                                        
-                                        const d = Math.hypot(s.segments[0].x - this.segments[0].x, s.segments[0].y - this.segments[0].y);
-                                        if (d < minDist) {
-                                            minDist = d;
-                                            targetSnake = s;
-                                        }
-                                    });
-                                    
-                                    // Only attempt wrapping if found a suitable target
-                                    if (targetSnake && minDist < 1200) {
-                                        const myX = this.segments[0].x;
-                                        const myY = this.segments[0].y;
-                                        const targetX = targetSnake.segments[0].x;
-                                        const targetY = targetSnake.segments[0].y;
-                                        
-                                        // Calculate how much of a circle we've already made around the target
-                                        let coverageMap = new Array(16).fill(false); // 16 sectors around target
-                                        this.segments.forEach(seg => {
-                                            const dx = seg.x - targetX;
-                                            const dy = seg.y - targetY;
-                                            const dist = Math.hypot(dx, dy);
-                                            
-                                            // Check if this segment is at wrapping distance
-                                            const wrapDist = targetSnake.radius * 4 + this.radius * 2;
-                                            if (dist > wrapDist - 50 && dist < wrapDist + 50) {
-                                                const angle = Math.atan2(dy, dx);
-                                                const sector = Math.floor(((angle + Math.PI) / (Math.PI * 2)) * 16) % 16;
-                                                coverageMap[sector] = true;
-                                            }
-                                        });
-                                        
-                                        // Count how many sectors are covered
-                                        const coverageCount = coverageMap.filter(x => x).length;
-                                        const wrapProgress = coverageCount / 16;
-                                        
-                                        // Determine wrapping strategy based on progress
-                                        const wrapRadius = targetSnake.radius * 4 + this.radius * 2;
-                                        const myDistFromTarget = Math.hypot(myX - targetX, myY - targetY);
-                                        
-                                        if (wrapProgress < 0.3) {
-                                            // Early stage: move to wrapping distance
-                                            if (myDistFromTarget < wrapRadius - 50) {
-                                                // Too close, move away while starting to circle
-                                                const awayAngle = Math.atan2(myY - targetY, myX - targetX);
-                                                const circleAngle = awayAngle + Math.PI / 4;
-                                                const goalX = targetX + Math.cos(circleAngle) * wrapRadius;
-                                                const goalY = targetY + Math.sin(circleAngle) * wrapRadius;
-                                                targetAngle = Math.atan2(goalY - myY, goalX - myX);
-                                            } else if (myDistFromTarget > wrapRadius + 100) {
-                                                // Too far, move closer while starting to circle
-                                                const towardAngle = Math.atan2(targetY - myY, targetX - myX);
-                                                const circleAngle = towardAngle + Math.PI / 4;
-                                                const goalX = targetX + Math.cos(circleAngle) * wrapRadius;
-                                                const goalY = targetY + Math.sin(circleAngle) * wrapRadius;
-                                                targetAngle = Math.atan2(goalY - myY, goalX - myX);
-                                            } else {
-                                                // At good distance, start circling
-                                                const currentAngle = Math.atan2(myY - targetY, myX - targetX);
-                                                const nextAngle = currentAngle + Math.PI / 8; // Move 1/16th around the circle
-                                                const goalX = targetX + Math.cos(nextAngle) * wrapRadius;
-                                                const goalY = targetY + Math.sin(nextAngle) * wrapRadius;
-                                                targetAngle = Math.atan2(goalY - myY, goalX - myX);
-                                            }
-                                        } else if (wrapProgress < 0.8) {
-                                            // Middle stage: continue circling, maintain distance
-                                            const currentAngle = Math.atan2(myY - targetY, myX - targetX);
-                                            
-                                            // Find the largest gap in coverage
-                                            let largestGapStart = -1;
-                                            let largestGapSize = 0;
-                                            let currentGapStart = -1;
-                                            let currentGapSize = 0;
-                                            
-                                            for (let i = 0; i < 16 * 2; i++) {
-                                                const idx = i % 16;
-                                                if (!coverageMap[idx]) {
-                                                    if (currentGapStart === -1) currentGapStart = idx;
-                                                    currentGapSize++;
-                                                } else {
-                                                    if (currentGapSize > largestGapSize) {
-                                                        largestGapSize = currentGapSize;
-                                                        largestGapStart = currentGapStart;
-                                                    }
-                                                    currentGapStart = -1;
-                                                    currentGapSize = 0;
-                                                }
-                                            }
-                                            
-                                            // Move toward the middle of the largest gap
-                                            if (largestGapStart !== -1) {
-                                                const gapMiddleSector = (largestGapStart + largestGapSize / 2) % 16;
-                                                const gapAngle = (gapMiddleSector / 16) * Math.PI * 2 - Math.PI;
-                                                const goalX = targetX + Math.cos(gapAngle) * wrapRadius;
-                                                const goalY = targetY + Math.sin(gapAngle) * wrapRadius;
-                                                targetAngle = Math.atan2(goalY - myY, goalX - myX);
-                                            } else {
-                                                // Keep circling if no gap found
-                                                const nextAngle = currentAngle + Math.PI / 12;
-                                                const goalX = targetX + Math.cos(nextAngle) * wrapRadius;
-                                                const goalY = targetY + Math.sin(nextAngle) * wrapRadius;
-                                                targetAngle = Math.atan2(goalY - myY, goalX - myX);
-                                            }
-                                        } else {
-                                            // Final stage: tighten the circle to trap
-                                            const tightenRadius = wrapRadius * 0.85; // Slightly smaller
-                                            const currentAngle = Math.atan2(myY - targetY, myX - targetX);
-                                            const nextAngle = currentAngle + Math.PI / 10;
-                                            const goalX = targetX + Math.cos(nextAngle) * tightenRadius;
-                                            const goalY = targetY + Math.sin(nextAngle) * tightenRadius;
-                                            targetAngle = Math.atan2(goalY - myY, goalX - myX);
-                                        }
-                                    }
-                                }
-                                
-                                // If not hunting snakes, look for food
-                                if (targetAngle === null) {
-                                    let nearest = null;
-                                    let minDist = 400;
-                                    foods.forEach(f => {
-                                        const d = Math.hypot(f.x - this.segments[0].x, f.y - this.segments[0].y);
-                                        if (d < minDist) {
-                                            minDist = d;
-                                            nearest = f;
-                                        }
-                                    });
-
-                                    if (nearest) {
-                                        targetAngle = Math.atan2(nearest.y - this.segments[0].y, nearest.x - this.segments[0].x);
-                                    }
-                                }
-
-                                if (targetAngle !== null) {
-                                    let diff = targetAngle - this.angle;
-                                    while (diff < -Math.PI) diff += Math.PI * 2;
-                                    while (diff > Math.PI) diff -= Math.PI * 2;
-                                    this.angle += diff * 0.05;
-                                } else {
-                                    this.angle += (Math.random() - 0.5) * 0.03;
-                                }
-                            }
-                        }
-                    }
-                }
-            } else {
-                const targetAngle = Math.atan2(mouse.y - windowHeight/2, mouse.x - windowWidth/2);
-                let diff = targetAngle - this.angle;
-                while (diff < -Math.PI) diff += Math.PI * 2;
-                while (diff > Math.PI) diff -= Math.PI * 2;
-                this.angle += diff * 0.06; // Smooth turning for player
-            }
-
-            const head = this.segments[0];
-            const nextX = head.x + Math.cos(this.angle) * this.speed;
-            const nextY = head.y + Math.sin(this.angle) * this.speed;
-
-            if (nextX < 0 || nextX > WORLD_SIZE || nextY < 0 || nextY > WORLD_SIZE) {
-                this.die();
-                return;
-            }
-
-            if (this.invulnerable <= 0) {
-                for (let other of snakes) {
-                    if (other.dead || other === this) continue;
-                    
-                    // Check collision with other snake's body
-                    for (let i = 0; i < other.segments.length; i++) {
-                        const seg = other.segments[i];
-                        const dist = Math.hypot(nextX - seg.x, nextY - seg.y);
-                        if (dist < this.radius + (other.radius * 0.7)) {
-                            // If this snake has power boost, the OTHER snake dies
-                            if (this.powerBoost) {
-                                const pointsGained = Math.ceil(other.score * 0.1);
-                                this.score += pointsGained;
-                                this.radius = Math.min(MAX_RADIUS, this.baseRadius + (this.score * 0.005));
-                                
-                                // Create kill notification
-                                killNotifications.push({
-                                    x: this.segments[0].x,
-                                    y: this.segments[0].y,
-                                    points: pointsGained,
-                                    createdAt: Date.now(),
-                                    duration: 2000 // 2 seconds
-                                });
-                                
-                                other.die();
-                                return;
-                            } else {
-                                // Normal collision: this snake dies
-                                const pointsGained = Math.ceil(this.score * 0.1);
-                                other.score += pointsGained;
-                                other.radius = Math.min(MAX_RADIUS, other.baseRadius + (other.score * 0.005));
-                                
-                                // Create kill notification for the other snake
-                                killNotifications.push({
-                                    x: other.segments[0].x,
-                                    y: other.segments[0].y,
-                                    points: pointsGained,
-                                    createdAt: Date.now(),
-                                    duration: 2000 // 2 seconds
-                                });
-                                
-                                this.die();
-                                return;
-                            }
-                        }
-                    }
-                }
-            }
-
-            // Add the new head position
-            const newHead = { x: nextX, y: nextY };
-            this.segments.unshift(newHead);
-            
-            // When boosting, add an intermediate segment to prevent gaps
-            if (this.isBoosting && this.segments.length > 1) {
-                const prevHead = this.segments[1];
-                const midX = (nextX + prevHead.x) / 2;
-                const midY = (nextY + prevHead.y) / 2;
-                this.segments.splice(1, 0, { x: midX, y: midY });
-            }
-
-            const targetLength = INITIAL_SNAKE_LENGTH + (this.score / 2);
-            while (this.segments.length > targetLength) {
-                this.segments.pop();
-            }
-
-            foods.forEach(f => {
-                const dist = Math.hypot(head.x - f.x, head.y - f.y);
-                
-                if (dist < MAGNET_DISTANCE + (this.radius * 2)) {
-                    f.magnetizedTo = this;
-                }
-
-                if (f.magnetizedTo === this) {
-                    const pullAngle = Math.atan2(head.y - f.y, head.x - f.x);
-                    f.x += Math.cos(pullAngle) * (this.speed + 5);
-                    f.y += Math.sin(pullAngle) * (this.speed + 5);
-                }
-
-                if (dist < this.radius + f.radius) {
-                    this.score += f.value;
-                    this.radius = Math.min(MAX_RADIUS, this.baseRadius + (this.score * 0.005));
-                    
-                    if (f.isPremium) {
-                        const idx = foods.indexOf(f);
-                        if (idx > -1) foods.splice(idx, 1);
-                    } else {
-                        f.reset();
-                    }
-                }
-            });
-        }
-
-        die() {
-            if (this.dead) return;
-            this.dead = true;
-            
-            for (let i = 0; i < this.segments.length; i += 4) {
-                const f = new Food(true);
-                f.x = this.segments[i].x;
-                f.y = this.segments[i].y;
-                f.color = this.color;
-                foods.push(f);
-            }
-
-            if (this === player) {
-                isPlaying = false;
-                setTimeout(() => endGame(), 800);
-            } else {
-                setTimeout(() => {
-                    const idx = snakes.indexOf(this);
-                    if (idx > -1) snakes.splice(idx, 1);
-                    snakes.push(new Snake("Bot " + Math.floor(Math.random() * 1000), COLORS[Math.floor(Math.random() * COLORS.length)], true));
-                }, 2000);
-            }
-        }
-
-        draw() {
-            if (this.dead || this.segments.length === 0) return;
-
-            const headX = this.segments[0].x - camera.x;
-            const headY = this.segments[0].y - camera.y;
-
-            // Use dynamic culling based on snake's actual size
-            const cullMargin = this.radius * this.segments.length * 0.5 + 100;
-            if (headX + cullMargin < 0 || headX - cullMargin > windowWidth ||
-                headY + cullMargin < 0 || headY - cullMargin > windowHeight) return;
-
-            if (this.invulnerable > 0) ctx.globalAlpha = 0.5;
-
-            // Draw power boost aura
-            if (this.powerBoost) {
-                const pulseIntensity = 0.5 + Math.sin(Date.now() * 0.01) * 0.5;
-                ctx.shadowBlur = 20 + pulseIntensity * 20;
-                ctx.shadowColor = '#ff0000';
-                
-                // Draw outer red glow circle around snake
-                ctx.strokeStyle = `rgba(255, 0, 0, ${0.6 * pulseIntensity})`;
-                ctx.lineWidth = 8;
-                ctx.beginPath();
-                ctx.arc(headX, headY, this.radius * 3, 0, Math.PI * 2);
-                ctx.stroke();
-                
-                ctx.shadowBlur = 0;
-            }
-
-            if (this.isBoosting) {
-                ctx.lineCap = 'round';
-                ctx.lineJoin = 'round';
-                ctx.strokeStyle = 'white';
-                ctx.lineWidth = this.radius * 2.4;
-                ctx.beginPath();
-                ctx.moveTo(this.segments[0].x - camera.x, this.segments[0].y - camera.y);
-                for (let i = 1; i < this.segments.length; i++) {
-                    ctx.lineTo(this.segments[i].x - camera.x, this.segments[i].y - camera.y);
-                }
-                ctx.stroke();
-            }
-
-            ctx.lineCap = 'round';
-            ctx.lineJoin = 'round';
-            ctx.strokeStyle = this.color;
-            ctx.lineWidth = this.radius * 2;
-            ctx.beginPath();
-            ctx.moveTo(this.segments[0].x - camera.x, this.segments[0].y - camera.y);
-            for (let i = 1; i < this.segments.length; i++) {
-                ctx.lineTo(this.segments[i].x - camera.x, this.segments[i].y - camera.y);
-            }
-            ctx.stroke();
-
-            ctx.fillStyle = 'rgba(0,0,0,0.2)';
-            for (let i = 0; i < this.segments.length; i += 5) {
-                const seg = this.segments[i];
-                ctx.beginPath();
-                ctx.arc(seg.x - camera.x, seg.y - camera.y, this.radius * 0.4, 0, Math.PI * 2);
-                ctx.fill();
-            }
-
-            ctx.globalAlpha = 1.0;
-
-            const head = this.segments[0];
-            const eyeDist = this.radius * 0.5;
-            const eyeSize = this.radius * 0.3;
-            
-            ctx.fillStyle = 'white';
-            ctx.beginPath();
-            ctx.arc(head.x - camera.x + Math.cos(this.angle - 0.5) * eyeDist, head.y - camera.y + Math.sin(this.angle - 0.5) * eyeDist, eyeSize, 0, Math.PI * 2);
-            ctx.fill();
-            ctx.beginPath();
-            ctx.arc(head.x - camera.x + Math.cos(this.angle + 0.5) * eyeDist, head.y - camera.y + Math.sin(this.angle + 0.5) * eyeDist, eyeSize, 0, Math.PI * 2);
-            ctx.fill();
-
-            ctx.fillStyle = 'white';
-            ctx.font = 'bold 14px Arial';
-            ctx.textAlign = 'center';
-            ctx.fillText(this.name, head.x - camera.x, head.y - camera.y - this.radius - 15);
-
-            // Draw orbiting gold crown for the king (1st place)
-            if (this === currentKing) {
-                const orbitRadius = this.radius * 1.5;
-                const orbitSpeed = 0.003;
-                const orbitAngle = Date.now() * orbitSpeed;
-                const crownX = head.x - camera.x + Math.cos(orbitAngle) * orbitRadius;
-                const crownY = head.y - camera.y + Math.sin(orbitAngle) * orbitRadius;
-                
-                // Draw glow effect
-                ctx.shadowBlur = 10;
-                ctx.shadowColor = '#fbbf24';
-                
-                // Draw gold circle
-                ctx.fillStyle = '#fbbf24';
-                ctx.beginPath();
-                ctx.arc(crownX, crownY, 5, 0, Math.PI * 2);
-                ctx.fill();
-                
-                // Draw inner shine
-                ctx.fillStyle = '#fef08a';
-                ctx.beginPath();
-                ctx.arc(crownX, crownY, 3, 0, Math.PI * 2);
-                ctx.fill();
-                
-                ctx.shadowBlur = 0;
-            }
-        }
-    }
+    socket.on('rampage', (data) => {
+        showPowerBoostNotification(data.snakeName);
+    });
 
     function resize() {
         windowWidth = window.innerWidth;
@@ -920,10 +269,18 @@
         window.addEventListener('mousemove', e => {
             mouse.x = e.clientX;
             mouse.y = e.clientY;
+            updateDirection();
         });
 
-        window.addEventListener('mousedown', () => mouse.down = true);
-        window.addEventListener('mouseup', () => mouse.down = false);
+        window.addEventListener('mousedown', () => {
+            mouse.down = true;
+            updateDirection();
+        });
+        
+        window.addEventListener('mouseup', () => {
+            mouse.down = false;
+            updateDirection();
+        });
 
         // Mobile touch controls
         window.addEventListener('touchstart', e => {
@@ -931,48 +288,49 @@
             mouse.x = touch.clientX;
             mouse.y = touch.clientY;
             
-            // Double tap detection for boost
             const currentTime = Date.now();
             const tapInterval = currentTime - lastTapTime;
             
             if (tapInterval < DOUBLE_TAP_DELAY && tapInterval > 0) {
-                // Double tap detected - activate boost
                 mouse.down = true;
             }
             
             lastTapTime = currentTime;
+            updateDirection();
         });
         
         window.addEventListener('touchend', () => {
-            // Release boost when touch ends
             mouse.down = false;
+            updateDirection();
         });
         
         window.addEventListener('touchmove', e => {
-            // Swipe to move - update direction
             const touch = e.touches[0];
             mouse.x = touch.clientX;
             mouse.y = touch.clientY;
+            updateDirection();
         });
 
         startBtn.addEventListener('click', startGame);
 
-        for (let i = 0; i < FOOD_COUNT; i++) foods.push(new Food());
-        for (let i = 0; i < BOT_COUNT; i++) {
-            snakes.push(new Snake("Bot " + (i+1), COLORS[Math.floor(Math.random() * COLORS.length)], true));
-        }
-
         requestAnimationFrame(gameLoop);
+    }
+
+    function updateDirection() {
+        if (!isPlaying) return;
+        
+        const targetAngle = Math.atan2(mouse.y - windowHeight/2, mouse.x - windowWidth/2);
+        socket.emit('updateDirection', {
+            angle: targetAngle,
+            boosting: mouse.down
+        });
     }
 
     function startGame() {
         const name = playerNameInput.value || "Player";
-        snakes = snakes.filter(s => s.isBot); 
-        player = new Snake(name, '#10b981', false);
-        snakes.push(player);
+        socket.emit('join', { name });
         
         isPlaying = true;
-        // Don't reset power boost timer - it should persist across deaths
         menu.classList.add('hidden');
         leaderboardEl.classList.remove('hidden');
         scoreDisplay.classList.remove('hidden');
@@ -984,79 +342,22 @@
         leaderboardEl.classList.add('hidden');
         scoreDisplay.classList.add('hidden');
         minimapContainer.classList.add('hidden');
-        snakes = snakes.filter(s => s !== player);
-        player = null;
+        isPlaying = false;
     }
 
     function updateLeaderboard() {
         const sorted = [...snakes].filter(s => !s.dead).sort((a, b) => b.score - a.score).slice(0, 10);
+        const player = snakes.find(s => s.id === playerId);
+        
         leaderboardList.innerHTML = sorted.map((s, i) => `
-            <div class="flex justify-between ${s === player ? 'text-green-400 font-bold' : ''}">
+            <div class="flex justify-between ${s.id === playerId ? 'text-green-400 font-bold' : ''}">
                 <span>${i + 1}. ${s.name}</span>
                 <span>${Math.floor(s.score)}</span>
             </div>
         `).join('');
+        
         currentKing = sorted[0] || null;
-        return sorted[0]; 
-    }
-
-    function drawMinimap(king) {
-        mctx.clearRect(0, 0, minimapCanvas.width, minimapCanvas.height);
-        const scale = minimapCanvas.width / WORLD_SIZE;
-
-        // Draw all snakes as lines
-        snakes.forEach(s => {
-            if (s.dead || s.segments.length === 0) return;
-            
-            // Determine color based on snake type and power boost
-            let color;
-            if (s.powerBoost) {
-                color = '#dc2626'; // Red for power boost
-            } else if (s === player) {
-                color = '#10b981'; // Green for player
-            } else if (s === king) {
-                color = '#fbbf24'; // Gold for king
-            } else {
-                color = '#64748b'; // Gray for other snakes
-            }
-            
-            // Draw snake body as connected line segments
-            mctx.strokeStyle = color;
-            mctx.lineWidth = Math.max(1, s.radius * scale * 0.8);
-            mctx.lineCap = 'round';
-            mctx.lineJoin = 'round';
-            
-            // Power boost snakes pulse and glow
-            if (s.powerBoost) {
-                const pulseIntensity = 0.5 + Math.sin(Date.now() * 0.01) * 0.5;
-                mctx.globalAlpha = 0.8 + pulseIntensity * 0.2;
-                mctx.shadowBlur = 5;
-                mctx.shadowColor = '#dc2626';
-            } else {
-                mctx.globalAlpha = (s === player || s === king) ? 1.0 : 0.6;
-            }
-            
-            mctx.beginPath();
-            mctx.moveTo(s.segments[0].x * scale, s.segments[0].y * scale);
-            
-            // Draw every few segments to keep minimap clean
-            const step = Math.max(1, Math.floor(s.segments.length / 20));
-            for (let i = step; i < s.segments.length; i += step) {
-                mctx.lineTo(s.segments[i].x * scale, s.segments[i].y * scale);
-            }
-            mctx.stroke();
-            
-            // Draw head as a small dot for emphasis
-            const headSize = (s === player || s === king) ? 2 : 1.5;
-            mctx.fillStyle = color;
-            mctx.globalAlpha = 1.0;
-            mctx.beginPath();
-            mctx.arc(s.segments[0].x * scale, s.segments[0].y * scale, headSize, 0, Math.PI * 2);
-            mctx.fill();
-            
-            mctx.globalAlpha = 1.0;
-            mctx.shadowBlur = 0;
-        });
+        return sorted[0];
     }
 
     function drawGrid() {
@@ -1085,32 +386,154 @@
         ctx.strokeRect(-camera.x, -camera.y, WORLD_SIZE, WORLD_SIZE);
     }
 
+    function drawFood() {
+        foods.forEach(f => {
+            const screenX = f.x - camera.x;
+            const screenY = f.y - camera.y;
+            
+            if (screenX + 20 < 0 || screenX - 20 > windowWidth ||
+                screenY + 20 < 0 || screenY - 20 > windowHeight) return;
+
+            if (f.isPremium) {
+                ctx.shadowBlur = 15;
+                ctx.shadowColor = f.color;
+            }
+
+            ctx.beginPath();
+            ctx.arc(screenX, screenY, f.radius, 0, Math.PI * 2);
+            ctx.fillStyle = f.color;
+            ctx.fill();
+            ctx.closePath();
+            ctx.shadowBlur = 0;
+        });
+    }
+
+    function drawSnakes() {
+        snakes.forEach(s => {
+            if (s.dead || s.segments.length === 0) return;
+
+            const headX = s.segments[0].x - camera.x;
+            const headY = s.segments[0].y - camera.y;
+
+            const cullMargin = s.radius * s.segments.length * 0.5 + 100;
+            if (headX + cullMargin < 0 || headX - cullMargin > windowWidth ||
+                headY + cullMargin < 0 || headY - cullMargin > windowHeight) return;
+
+            if (s.invulnerable > 0) ctx.globalAlpha = 0.5;
+
+            // Power boost aura
+            if (s.powerBoost) {
+                const pulseIntensity = 0.5 + Math.sin(Date.now() * 0.01) * 0.5;
+                ctx.shadowBlur = 20 + pulseIntensity * 20;
+                ctx.shadowColor = '#ff0000';
+                
+                ctx.strokeStyle = `rgba(255, 0, 0, ${0.6 * pulseIntensity})`;
+                ctx.lineWidth = 8;
+                ctx.beginPath();
+                ctx.arc(headX, headY, s.radius * 3, 0, Math.PI * 2);
+                ctx.stroke();
+                
+                ctx.shadowBlur = 0;
+            }
+
+            // Boost trail
+            if (s.isBoosting) {
+                ctx.lineCap = 'round';
+                ctx.lineJoin = 'round';
+                ctx.strokeStyle = 'white';
+                ctx.lineWidth = s.radius * 2.4;
+                ctx.beginPath();
+                ctx.moveTo(s.segments[0].x - camera.x, s.segments[0].y - camera.y);
+                for (let i = 1; i < s.segments.length; i++) {
+                    ctx.lineTo(s.segments[i].x - camera.x, s.segments[i].y - camera.y);
+                }
+                ctx.stroke();
+            }
+
+            // Body
+            ctx.lineCap = 'round';
+            ctx.lineJoin = 'round';
+            ctx.strokeStyle = s.color;
+            ctx.lineWidth = s.radius * 2;
+            ctx.beginPath();
+            ctx.moveTo(s.segments[0].x - camera.x, s.segments[0].y - camera.y);
+            for (let i = 1; i < s.segments.length; i++) {
+                ctx.lineTo(s.segments[i].x - camera.x, s.segments[i].y - camera.y);
+            }
+            ctx.stroke();
+
+            // Spots
+            ctx.fillStyle = 'rgba(0,0,0,0.2)';
+            for (let i = 0; i < s.segments.length; i += 5) {
+                const seg = s.segments[i];
+                ctx.beginPath();
+                ctx.arc(seg.x - camera.x, seg.y - camera.y, s.radius * 0.4, 0, Math.PI * 2);
+                ctx.fill();
+            }
+
+            ctx.globalAlpha = 1.0;
+
+            // Eyes
+            const head = s.segments[0];
+            const eyeDist = s.radius * 0.5;
+            const eyeSize = s.radius * 0.3;
+            
+            ctx.fillStyle = 'white';
+            ctx.beginPath();
+            ctx.arc(head.x - camera.x + Math.cos(s.angle - 0.5) * eyeDist, head.y - camera.y + Math.sin(s.angle - 0.5) * eyeDist, eyeSize, 0, Math.PI * 2);
+            ctx.fill();
+            ctx.beginPath();
+            ctx.arc(head.x - camera.x + Math.cos(s.angle + 0.5) * eyeDist, head.y - camera.y + Math.sin(s.angle + 0.5) * eyeDist, eyeSize, 0, Math.PI * 2);
+            ctx.fill();
+
+            // Name
+            ctx.fillStyle = 'white';
+            ctx.font = 'bold 14px Arial';
+            ctx.textAlign = 'center';
+            ctx.fillText(s.name, head.x - camera.x, head.y - camera.y - s.radius - 15);
+
+            // King crown
+            if (s.id === currentKing?.id) {
+                const orbitRadius = s.radius * 1.5;
+                const orbitSpeed = 0.003;
+                const orbitAngle = Date.now() * orbitSpeed;
+                const crownX = head.x - camera.x + Math.cos(orbitAngle) * orbitRadius;
+                const crownY = head.y - camera.y + Math.sin(orbitAngle) * orbitRadius;
+                
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = '#fbbf24';
+                
+                ctx.fillStyle = '#fbbf24';
+                ctx.beginPath();
+                ctx.arc(crownX, crownY, 5, 0, Math.PI * 2);
+                ctx.fill();
+                
+                ctx.fillStyle = '#fef08a';
+                ctx.beginPath();
+                ctx.arc(crownX, crownY, 3, 0, Math.PI * 2);
+                ctx.fill();
+                
+                ctx.shadowBlur = 0;
+            }
+        });
+    }
+
     function drawKillNotifications() {
         const now = Date.now();
         
-        // Filter out expired notifications
-        killNotifications = killNotifications.filter(notif => {
-            return now - notif.createdAt < notif.duration;
-        });
-        
-        // Draw active notifications
         killNotifications.forEach(notif => {
             const elapsed = now - notif.createdAt;
             const progress = elapsed / notif.duration;
             
-            // Float upward
-            const yOffset = progress * 60; // Move up 60 pixels over lifetime
+            const yOffset = progress * 60;
             const screenX = notif.x - camera.x;
             const screenY = notif.y - camera.y - yOffset;
             
-            // Fade out near the end
             const alpha = progress < 0.7 ? 1.0 : 1.0 - ((progress - 0.7) / 0.3);
             
-            // Draw the notification
             ctx.save();
             ctx.globalAlpha = alpha;
             
-            // Draw text with glow
             ctx.shadowBlur = 10;
             ctx.shadowColor = '#10b981';
             ctx.fillStyle = '#10b981';
@@ -1118,7 +541,6 @@
             ctx.textAlign = 'center';
             ctx.fillText(`+${notif.points}`, screenX, screenY);
             
-            // Draw outline for better visibility
             ctx.strokeStyle = '#ffffff';
             ctx.lineWidth = 3;
             ctx.strokeText(`+${notif.points}`, screenX, screenY);
@@ -1129,63 +551,60 @@
         });
     }
 
-    function gameLoop() {
-        ctx.clearRect(0, 0, windowWidth, windowHeight);
+    function drawMinimap() {
+        mctx.clearRect(0, 0, minimapCanvas.width, minimapCanvas.height);
+        const scale = minimapCanvas.width / WORLD_SIZE;
 
-        if (player && !player.dead) {
-            camera.x = player.segments[0].x - windowWidth / 2;
-            camera.y = player.segments[0].y - windowHeight / 2;
-            scoreVal.innerText = Math.floor(player.score);
-            
-            // Update power boost timer display
-            const timeUntilNextBoost = Math.max(0, POWER_BOOST_INTERVAL - (Date.now() - lastPowerBoostTime));
-            const secondsRemaining = Math.ceil(timeUntilNextBoost / 1000);
-            document.getElementById('timer-value').innerText = secondsRemaining;
-        }
-
-        // Check if it's time to give someone a power boost
-        if (Date.now() - lastPowerBoostTime > POWER_BOOST_INTERVAL) {
-            const aliveSnakes = snakes.filter(s => !s.dead);
-            if (aliveSnakes.length > 0) {
-                let luckySnake;
-                
-                // 30% chance player gets rampage (if alive)
-                if (player && !player.dead && Math.random() < 0.3) {
-                    luckySnake = player;
-                } else {
-                    // Otherwise, random snake gets it
-                    luckySnake = aliveSnakes[Math.floor(Math.random() * aliveSnakes.length)];
-                }
-                
-                luckySnake.powerBoost = true;
-                luckySnake.powerBoostEndTime = Date.now() + POWER_BOOST_DURATION;
-                lastPowerBoostTime = Date.now();
-                
-                // Show notification
-                showPowerBoostNotification(luckySnake.name);
-            }
-        }
-
-        drawGrid();
-        foods.forEach(f => f.draw());
         snakes.forEach(s => {
-            s.update();
-            s.draw();
+            if (s.dead || s.segments.length === 0) return;
+            
+            let color;
+            if (s.powerBoost) {
+                color = '#dc2626';
+            } else if (s.id === playerId) {
+                color = '#10b981';
+            } else if (s.id === currentKing?.id) {
+                color = '#fbbf24';
+            } else {
+                color = '#64748b';
+            }
+            
+            mctx.strokeStyle = color;
+            mctx.lineWidth = Math.max(1, s.radius * scale * 0.8);
+            mctx.lineCap = 'round';
+            mctx.lineJoin = 'round';
+            
+            if (s.powerBoost) {
+                const pulseIntensity = 0.5 + Math.sin(Date.now() * 0.01) * 0.5;
+                mctx.globalAlpha = 0.8 + pulseIntensity * 0.2;
+                mctx.shadowBlur = 5;
+                mctx.shadowColor = '#dc2626';
+            } else {
+                mctx.globalAlpha = (s.id === playerId || s.id === currentKing?.id) ? 1.0 : 0.6;
+            }
+            
+            mctx.beginPath();
+            mctx.moveTo(s.segments[0].x * scale, s.segments[0].y * scale);
+            
+            const step = Math.max(1, Math.floor(s.segments.length / 20));
+            for (let i = step; i < s.segments.length; i += step) {
+                mctx.lineTo(s.segments[i].x * scale, s.segments[i].y * scale);
+            }
+            mctx.stroke();
+            
+            const headSize = (s.id === playerId || s.id === currentKing?.id) ? 2 : 1.5;
+            mctx.fillStyle = color;
+            mctx.globalAlpha = 1.0;
+            mctx.beginPath();
+            mctx.arc(s.segments[0].x * scale, s.segments[0].y * scale, headSize, 0, Math.PI * 2);
+            mctx.fill();
+            
+            mctx.globalAlpha = 1.0;
+            mctx.shadowBlur = 0;
         });
-        
-        // Draw kill notifications on top of everything
-        drawKillNotifications();
-
-        if (Date.now() % 100 < 20) {
-            const king = updateLeaderboard();
-            drawMinimap(king);
-        }
-
-        requestAnimationFrame(gameLoop);
     }
 
     function showPowerBoostNotification(snakeName) {
-        // Create notification element
         const notification = document.createElement('div');
         notification.style.position = 'fixed';
         notification.style.top = '20px';
@@ -1205,13 +624,34 @@
         
         document.body.appendChild(notification);
         
-        // Remove after 3 seconds
         setTimeout(() => {
             notification.remove();
         }, 3000);
+    }
+
+    function gameLoop() {
+        ctx.clearRect(0, 0, windowWidth, windowHeight);
+
+        const player = snakes.find(s => s.id === playerId);
+        if (player && !player.dead && isPlaying) {
+            camera.x = player.segments[0].x - windowWidth / 2;
+            camera.y = player.segments[0].y - windowHeight / 2;
+            scoreVal.innerText = Math.floor(player.score);
+        }
+
+        drawGrid();
+        drawFood();
+        drawSnakes();
+        drawKillNotifications();
+
+        updateLeaderboard();
+        drawMinimap();
+
+        requestAnimationFrame(gameLoop);
     }
 
     init();
 </script>
 </body>
 </html>
+
